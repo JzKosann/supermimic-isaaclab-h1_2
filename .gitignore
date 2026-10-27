@@ -1,0 +1,20 @@
+# downloaded / generated data and models (scripts/download_assets.py, scripts/csv_to_npz.py)
+assets/unitree_model/
+datasets/
+
+# training outputs
+logs/
+outputs/
+wandb/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,20 @@
+[package]
+
+# Semantic Versioning is used: https://semver.org/
+version = "0.1.0"
+
+category = "isaaclab"
+
+title = "SuperMimic for Unitree H1-2"
+author = "JinzZz"
+maintainer = "JinzZz"
+description = "Unofficial reproduction of SuperMimic (differentiable world model + BPTT motion tracking) on Isaac Lab with Unitree H1-2"
+repository = ""
+keywords = ["isaaclab", "humanoid", "motion-tracking", "world-model", "unitree-h1-2"]
+
+[dependencies]
+"isaaclab" = {}
+"isaaclab_tasks" = {}
+
+[[python.module]]
+name = "supermimic_h1_2"

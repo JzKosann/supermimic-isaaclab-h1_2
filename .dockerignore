@@ -1,0 +1,9 @@
+# data, models and logs are mounted from the host at run time, not baked into the image
+.git/
+assets/unitree_model/
+datasets/
+logs/
+outputs/
+wandb/
+**/__pycache__/
+**/*.egg-info/
