@@ -62,6 +62,7 @@ def main():
     env_cfg = parse_env_cfg(args_cli.task, device=device, num_envs=args_cli.num_envs)
     env_cfg.observations.policy.enable_corruption = False
     env_cfg.observations.goal.enable_corruption = False
+    env_cfg.actions.joint_pos.noise_std = 0.0  # so that the executed action can be compared with heads.exec_action (v2 guard)
     if args_cli.include:
         env_cfg.commands.motion.include = args_cli.include
     env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
@@ -69,10 +70,12 @@ def main():
     cmd = env.command_manager.get_term("motion")
     lib = cmd.library
     nj = robot.num_joints
+    act = env.action_manager.get_term("joint_pos")
     heads = AnalyticHeads(
         cmd.fk, cmd.body_names, cmd.cfg.anchor_body_name,
         robot.data.soft_joint_pos_limits[0].clone(), robot.data.default_joint_pos[0].clone(),
-    )  # fmt: skip
+        action_bounds=act.action_bounds, action_scale=act.cfg.scale,
+    )  # fmt: skip  (v2: the joint-limit term includes the overshoot beyond the joint-target guard)
     state_io = StateIO(env)
     ctx = get_sim_context(env)
     all_links = cmd.fk.link_indices(robot.body_names)
@@ -121,6 +124,8 @@ def main():
         for i, k in enumerate(REWARD_TERM_NAMES):
             upd(f"reward/{k}", (terms[k] - env_terms[:, i]).abs())
         upd("reward/total", (terms["total"] - rew[keep]).abs())
+        if act.action_bounds is not None:  # v2 guard: executed (clamped) action = heads.exec_action of the noise-free action
+            upd("guard/exec_action", (heads.exec_action(a[keep]) - act.executed_raw[keep]).abs())
         # 4. goal (-Anchor variants also compare the anchor-relative pose: robot anchor from FK in imagination + reference anchor of the current target frame)
         upd("goal", (lib.goal_window(cmd.frame[keep], cmd.cfg.future_frames) - obs["goal"][keep][:, : cmd.cfg.future_frames * lib.goal_dim]).abs())
         if env.cfg.anchor_obs:

@@ -5,6 +5,8 @@
   anchor when the command updates (the reward lags one step); here the current robot anchor is used when the reward is computed, exactly as in imagination from the predicted state.
 - Root position / orientation: the anchor (torso_link) is compared in the world frame; body linear / angular velocities are compared in the world frame (link-origin velocities).
 - No self-collision term; joint limit -2 (BeyondMimic: -10).
+- v2 joint-target guard (actions.py): the joint-limit term also counts how far the policy's joint targets go beyond the guard (rad),
+  on both sides (joint_limit_with_guard / the overshoot argument of weighted_terms).
 All terms are multiplied by dt = 0.02 s (the Isaac reward manager multiplies weight * dt itself; imagination does it in weighted_terms); at most 0.1 per step.
 """
 
@@ -19,6 +21,7 @@ from .rotations import quat_apply, quat_box_minus, quat_conjugate, quat_mul, yaw
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+    from isaaclab.managers import SceneEntityCfg
 
 
 @dataclass(frozen=True)
@@ -102,6 +105,22 @@ def joint_limit_violation(joint_pos: torch.Tensor, soft_limits: torch.Tensor) ->
     return ((soft_limits[..., 0] - joint_pos).clamp(min=0.0) + (joint_pos - soft_limits[..., 1]).clamp(min=0.0)).sum(-1)
 
 
+def target_overshoot(action: torch.Tensor, bounds: torch.Tensor, scale) -> torch.Tensor:
+    """Sum over joints of how far the joint targets go beyond the guard (rad). action (...,NJ) and bounds (NJ,2) are in action units.
+    The clamped part of an action has no gradient through the dynamics; without this penalty the raw output can drift further and
+    further outside the guard and then jump back in one large step. Added to the joint-limit term (same weight)."""
+    over = (action - action.clamp(bounds[:, 0], bounds[:, 1])).abs()
+    return (over * scale).sum(-1)
+
+
+def joint_limit_with_guard(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, action_name: str = "joint_pos") -> torch.Tensor:
+    """Simulator-side joint-limit term with the v2 guard: soft-limit violation (as isaaclab mdp.joint_pos_limits) + the overshoot of the
+    policy's joint targets beyond the guard; matches weighted_terms(..., overshoot) in imagination."""
+    robot = env.scene[asset_cfg.name]
+    violation = joint_limit_violation(robot.data.joint_pos[:, asset_cfg.joint_ids], robot.data.soft_joint_pos_limits[:, asset_cfg.joint_ids])
+    return violation + env.action_manager.get_term(action_name).target_overshoot()
+
+
 def weighted_terms(
     errors: dict[str, torch.Tensor],
     action: torch.Tensor,
@@ -109,9 +128,14 @@ def weighted_terms(
     joint_pos: torch.Tensor,
     soft_limits: torch.Tensor,
     cfg: TrackingRewardCfg = REWARD,
+    overshoot: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """For imagination: terms (N,) already multiplied by weight and dt, plus 'total'; identical term by term to the Isaac reward manager."""
+    """For imagination: terms (N,) already multiplied by weight and dt, plus 'total'; identical term by term to the Isaac reward manager.
+    overshoot: with the v2 joint-target guard, how far the joint targets go beyond it (rad); added to the joint-limit term."""
     dt = cfg.dt
+    limit = joint_limit_violation(joint_pos, soft_limits)
+    if overshoot is not None:
+        limit = limit + overshoot
     t = {
         "root_pos": dt * cfg.w_root_pos * torch.exp(-errors["root_pos"] / cfg.std_root_pos**2),
         "root_ori": dt * cfg.w_root_ori * torch.exp(-errors["root_ori"] / cfg.std_root_ori**2),
@@ -120,7 +144,7 @@ def weighted_terms(
         "body_lin_vel": dt * cfg.w_body_lin_vel * torch.exp(-errors["body_lin_vel"] / cfg.std_body_lin_vel**2),
         "body_ang_vel": dt * cfg.w_body_ang_vel * torch.exp(-errors["body_ang_vel"] / cfg.std_body_ang_vel**2),
         "action_rate": dt * cfg.w_action_rate * _sq(action - prev_action),
-        "joint_limit": dt * cfg.w_joint_limit * joint_limit_violation(joint_pos, soft_limits),
+        "joint_limit": dt * cfg.w_joint_limit * limit,
     }
     total = t["root_pos"]
     for k in REWARD_TERM_NAMES[1:]:

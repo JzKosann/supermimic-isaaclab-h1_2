@@ -11,13 +11,31 @@ v1 (following supermimic_vibed; three switches in PolicyTrainerCfg, off by defau
     analytic_termination      d uses analytic soft thresholds (heads.soft_termination) instead of the learned termination head
     critic_tracking_features  extra critic input: tracking errors (heads.critic_tracking_features), measured against the state's own reference frame
 The reference-orientation observation term (PolicyCfg.ref_ori_obs) and the trajectory goal (goal_mode="traj") follow the environment and are not switched here.
+
+v2 (switches in PolicyTrainerCfg, all off by default = v0 / v1; trainer.apply_recipe turns them on). With the v1 settings our runs on
+larger datasets diverged after ~10k updates: the critic is bootstrapped from itself with no target network, the policy objective
+puts ~70 % of its weight on gamma^H V_H, so an over-estimated value is chased by the policy and grows further.
+    policy_ema            exponential moving average of the policy weights (0.995, Uni-SuperMimic); used for evaluation only
+    paper_clip            the loss here is -J/H; the paper's clipping (global norm 1.0, element-wise 0.1) is meant for -J, so both
+                          thresholds are divided by H (without it the clip almost never acts)
+    value_cap             V is clamped to r_max / (1 - gamma) (10 here) in the bootstrap targets and in V_H of J: with at most
+                          r_max per step no true value can be larger (realmimic uses the same cap)
+    absorb_thr            absorbing state: once the survival weight c falls below this, the trajectory is frozen where it died
+                          (state detached, reward 0) instead of being extrapolated by the model far outside its data
+    critic_survival_weight  the critic loss is weighted by sg(c_t): values of states after death are not fitted (they are multiplied
+                          by c ~ 0 wherever they are used)
+    skip_nonfinite        a policy step / critic minibatch whose gradient norm is NaN / Inf is skipped
+    freeze_clip_end       (env side, motion command): with it imagination may start up to the last frame and roll past the clip
+                          end, where the reference stops with zero velocity (start_within_clip then only requires the start to be inside the clip)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from .distributed import allreduce_grads
 from .heads import (
@@ -31,7 +49,7 @@ from .heads import (
 from .motion_library import MotionLibrary
 from .policy import Critic, Policy
 from .replay import ReplayBuffer, StartBatch
-from .rewards import REWARD_TERM_NAMES
+from .rewards import REWARD, REWARD_TERM_NAMES
 from .world_model import WorldModel, maybe_compile
 
 ANCHOR_NOISE_HALF = (0.25,) * 3 + (0.05,) * 6
@@ -59,7 +77,7 @@ class ImagStep:
         wm = self.wm
         heads = wm.heads
         ref = ReferenceFrame(ref_pos, ref_quat, ref_lin, ref_ang, ref_root_pos, ref_root_quat, ref_joint_pos)
-        s_next = wm.step(s, a, xi)
+        s_next = wm.step(s, heads.exec_action(a), xi)  # with the v2 guard: clamped like executed_raw in the replay buffer
         bodies = heads.robot_bodies(s_next)
         terms = heads.reward(s_next, a, a_prev, ref, bodies)
         term_vec = torch.stack([terms[k] for k in REWARD_TERM_NAMES], dim=0)
@@ -97,7 +115,16 @@ class ImagRollout:
     reward_terms: torch.Tensor  # (8,) mean of each term over the rollout (diagnostics)
 
 
-def imagine(wm: WorldModel, policy: Policy, lib: MotionLibrary, start: StartBatch, horizon: int, step_fn: ImagStep, obs_noise: bool = True) -> ImagRollout:
+def imagine(
+    wm: WorldModel,
+    policy: Policy,
+    lib: MotionLibrary,
+    start: StartBatch,
+    horizon: int,
+    step_fn: ImagStep,
+    obs_noise: bool = True,
+    absorb_thr: float = 0.0,
+) -> ImagRollout:
     pcfg = policy.cfg
     heads = wm.heads
     dev = start.state.device
@@ -112,15 +139,21 @@ def imagine(wm: WorldModel, policy: Policy, lib: MotionLibrary, start: StartBatc
 
     # target frames of the whole rollout (frame + t, clamped to the last frame of the clip), fetched at once
     last = lib.last_frame_of(start.frame)
-    frames = torch.minimum(start.frame[None, :] + torch.arange(horizon + 1, device=dev)[:, None], last[None, :])
+    virtual = start.frame[None, :] + torch.arange(horizon + 1, device=dev)[:, None]
+    frames = torch.minimum(virtual, last[None, :])
+    beyond = (virtual - last[None, :]).clamp_min(0)  # steps past the clip end: the reference stays at the last frame
     ref_all = reference_at(lib, frames.reshape(-1))
+    if lib.freeze_end:  # the stopped reference has zero velocity, so the velocity rewards score "standing still"
+        held = (beyond.reshape(-1) > 0)[:, None, None]
+        ref_all.body_lin_vel_w = torch.where(held, torch.zeros_like(ref_all.body_lin_vel_w), ref_all.body_lin_vel_w)
+        ref_all.body_ang_vel_w = torch.where(held, torch.zeros_like(ref_all.body_ang_vel_w), ref_all.body_ang_vel_w)
 
     def ref_at(t: int) -> ReferenceFrame:
         sl = slice(t * n, (t + 1) * n)
         return ReferenceFrame(*(getattr(ref_all, k)[sl] for k in ReferenceFrame.__dataclass_fields__))
 
     def make_goal(t: int, ref: ReferenceFrame, anchor_pose):
-        g = lib.goal_window(frames[t], pcfg.future_frames)
+        g = lib.goal_window(frames[t], pcfg.future_frames, beyond[t] if lib.freeze_end else None)
         if not pcfg.anchor_obs:
             return g
         ai = heads.anchor_index
@@ -157,7 +190,12 @@ def imagine(wm: WorldModel, policy: Policy, lib: MotionLibrary, start: StartBatc
     term_sum = torch.zeros(len(REWARD_TERM_NAMES), device=dev)
     for t in range(horizon):
         a = policy(flatten_history_term_major(torch.stack(hist, 0), term_dims), goals[-1])
+        s_prev = s
         s, r, term_vec, d, obs_clean, anchor_pose, crit = step_fn(s, a, a_prev, start.xi, ref)
+        if absorb_thr > 0:  # absorbing state: a trajectory that is already dead is not extrapolated (state frozen and detached, reward 0)
+            alive = c >= absorb_thr
+            s = torch.where(alive[:, None], s, s_prev.detach())
+            r = r * alive
         c = c * (1.0 - d)
         term_sum += term_vec.detach().mean(-1)
         ref = ref_at(t + 1)
@@ -227,6 +265,14 @@ class PolicyTrainerCfg:
     start_within_clip: bool = False
     analytic_termination: bool = False
     critic_tracking_features: bool = False
+    # v2 switches (see the module docstring), off by default = v0 / v1
+    policy_ema: float = 0.0  # EMA decay of the averaged policy (v2: 0.995); 0 = no averaged policy
+    paper_clip: bool = False
+    value_cap: bool = False
+    absorb_thr: float = 0.0  # v2: 1e-3
+    critic_survival_weight: bool = False
+    skip_nonfinite: bool = False
+    outlier_action: float = 100.0  # diagnostics: report the imagined trajectory with the largest action when |a| exceeds this
 
 
 class PolicyTrainer:
@@ -234,9 +280,22 @@ class PolicyTrainer:
         self.wm, self.policy, self.critic, self.lib, self.cfg = wm, policy, critic, lib, cfg
         self.opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr, betas=cfg.betas)
         self.critic_opt = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
+        self.policy_ema = (
+            AveragedModel(policy, multi_avg_fn=get_ema_multi_avg_fn(cfg.policy_ema), use_buffers=True)
+            if cfg.policy_ema > 0
+            else None
+        )
         self.step_fn = ImagStep(
             wm, lib.default_joint_pos, cfg.compile, cfg.analytic_termination, cfg.critic_tracking_features
         )
+        # the loss is -J/H: the paper's clip thresholds (for -J) are divided by H when paper_clip is on
+        clip_div = cfg.horizon if cfg.paper_clip else 1
+        self.clip_norm = cfg.grad_clip_norm / clip_div
+        self.clip_value = cfg.grad_clip_value / clip_div
+        self.value_bound = REWARD.max_step_reward / (1.0 - cfg.gamma)
+        self.outlier_dir: Path | None = None  # set to <run>/outliers by the Trainer on rank 0
+        self._outliers = 0
+        self.nonfinite_skips = 0
 
     def set_lr(self, lr: float, critic_lr: float) -> None:
         for g in self.opt.param_groups:
@@ -244,28 +303,65 @@ class PolicyTrainer:
         for g in self.critic_opt.param_groups:
             g["lr"] = critic_lr
 
+    @torch.no_grad()
+    def _report_outlier(self, ro: ImagRollout, start: StartBatch) -> None:
+        """Prints (and saves the first 20 of) the imagined trajectory with the largest action. Large already at t=0 = caused by the
+        start state / observation; growing over t = produced by the imagination itself."""
+        self._outliers += 1
+        if self._outliers > 20:
+            return
+        peak = ro.actions.abs().amax((0, 2))
+        i = int(peak.argmax())
+        s, a, r = ro.states[:, i], ro.actions[:, i], ro.rewards[:, i]
+        fmt = lambda x: " ".join(f"{float(v):.3g}" for v in x)  # noqa: E731
+        print(
+            f"[outlier {self._outliers}] {int((peak > self.cfg.outlier_action).sum())}/{peak.shape[0]} samples above the limit | "
+            f"target frame {int(start.frame[i])} | |a|max(t) {fmt(a.abs().amax(-1))} | |s|max(t) {fmt(s.abs().amax(-1))} | r(t) {fmt(r)}",
+            flush=True,
+        )
+        if self.outlier_dir is None:
+            return
+        self.outlier_dir.mkdir(parents=True, exist_ok=True)
+        rec = {"states": s, "actions": a, "rewards": r, "dhat": ro.dhat[:, i], "survival": ro.survival[:, i], "goals": ro.goals[:, i],
+               "hist_states": start.hist_states[:, i], "hist_actions": start.hist_actions[:, i], "hist_frames": start.hist_frames[:, i],
+               "frame": start.frame[i], "xi": start.xi[i], "prev_action": start.prev_action[i]}  # fmt: skip
+        torch.save({k: v.detach().cpu() for k, v in rec.items()}, self.outlier_dir / f"outlier_{self._outliers:02d}.pt")
+
     def update(self, buffer: ReplayBuffer) -> dict[str, float]:
         cfg = self.cfg
         extra = None
         if cfg.start_within_clip:
-            extra = self.lib.last_frame_of(buffer.frame) - buffer.frame >= cfg.horizon
+            # with freeze_clip_end imagination may roll past the clip end, so the start only has to lie inside the clip;
+            # otherwise all H steps must stay inside it (and the clip end is never trained)
+            margin = 1 if self.lib.freeze_end else cfg.horizon
+            extra = self.lib.last_frame_of(buffer.frame) - buffer.frame >= margin
         start = buffer.sample_starts(cfg.batch_size, self.policy.cfg.history, extra)
         xi_norm = self.wm.spec.normalize_xi(start.xi)
 
         # ---- actor: BPTT through the frozen world model
         self.wm.requires_grad_(False)
         self.critic.requires_grad_(False)
-        ro = imagine(self.wm, self.policy, self.lib, start, cfg.horizon, self.step_fn, cfg.obs_noise)
+        ro = imagine(self.wm, self.policy, self.lib, start, cfg.horizon, self.step_fn, cfg.obs_noise, cfg.absorb_thr)
         H1, n, _ = ro.states.shape
         feat = self.wm.spec.canonical(ro.states.reshape(H1 * n, -1)).reshape(H1, n, -1)
         v_H = self.critic(feat[-1], ro.goals[-1], xi_norm, ro.critic_extra[-1]) if cfg.use_critic else None
+        if v_H is not None and cfg.value_cap:
+            v_H = v_H.clamp(max=self.value_bound)
         J = policy_objective(ro, v_H, cfg.gamma)
         self.opt.zero_grad(set_to_none=True)
         (-J / cfg.horizon).backward()
         allreduce_grads(self.policy)
-        gn = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.grad_clip_norm)
-        torch.nn.utils.clip_grad_value_(self.policy.parameters(), cfg.grad_clip_value)
-        self.opt.step()
+        gn = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.clip_norm)
+        torch.nn.utils.clip_grad_value_(self.policy.parameters(), self.clip_value)
+        skipped = cfg.skip_nonfinite and not bool(torch.isfinite(gn))
+        if skipped:  # NaN / Inf in the gradient: skip this step (after the all-reduce every rank agrees, so ranks stay in sync)
+            self.opt.zero_grad(set_to_none=True)
+            self.nonfinite_skips += 1
+            print(f"[WARN] non-finite policy gradient (#{self.nonfinite_skips}), update skipped", flush=True)
+        else:
+            self.opt.step()
+            if self.policy_ema is not None:
+                self.policy_ema.update_parameters(self.policy)
         self.wm.requires_grad_(True)
         self.critic.requires_grad_(True)
 
@@ -276,9 +372,18 @@ class PolicyTrainer:
             "imag_dhat_mean": ro.dhat[1:].mean().detach(),
             "policy_grad_norm": gn.detach(),
             "action_abs_mean": ro.actions.abs().mean().detach(),
+            # stability diagnostics: spikes here precede divergence (see the *_peak metrics logged by the Trainer)
+            "action_abs_max": ro.actions.abs().max().detach(),
+            "imag_state_abs_max": ro.states.abs().max().detach(),
+            "imag_reward_min": ro.rewards.min().detach(),
+            "nonfinite_skips": torch.tensor(float(self.nonfinite_skips)),
         }
+        if cfg.absorb_thr > 0:  # share of imagined trajectories that died (and were frozen) within the horizon
+            m["imag_absorbed_frac"] = (ro.survival[-1] < cfg.absorb_thr).float().mean().detach()
         for k, v in zip(REWARD_TERM_NAMES, ro.reward_terms):
             m[f"imag_r/{k}"] = v
+        if m["action_abs_max"] > cfg.outlier_action:
+            self._report_outlier(ro, start)
 
         # ---- critic: GAE targets of this rollout (fixed)
         if cfg.use_critic:
@@ -288,10 +393,19 @@ class PolicyTrainer:
                 X_er = ro.critic_extra.detach()
                 X_xi = xi_norm[None].expand(H1, n, -1)
                 flat = lambda x: x.reshape(H1 * n, -1)  # noqa: E731
+                self.critic.update_norm(flat(X_feat), flat(X_goal), flat(X_xi), flat(X_er))
                 values = self.critic(flat(X_feat), flat(X_goal), flat(X_xi), flat(X_er)).reshape(H1, n)
+                m["critic_value_mean"] = values.mean()
+                m["critic_value_max"] = values.max()
+                # share of values above r_max / (1 - gamma), which no true value can exceed (logged with or without value_cap)
+                m["critic_over_bound_frac"] = (values > self.value_bound).float().mean()
+                if cfg.value_cap:
+                    values = values.clamp(max=self.value_bound)
                 targets = gae_targets(ro.rewards.detach(), ro.dhat[1:].detach(), values, cfg.gamma, cfg.gae_lambda)
                 X = [x[:-1].reshape(-1, x.shape[-1]) for x in (X_feat, X_goal, X_xi, X_er)]
                 Y = targets.reshape(-1)
+                # survival weight sg(c_t): values of states after death are not fitted (v0 / v1: plain MSE)
+                W = ro.survival[:-1].detach().reshape(-1) if cfg.critic_survival_weight else None
             N = Y.shape[0]
             mb = N // cfg.critic_minibatches
             closs = torch.zeros((), device=Y.device)
@@ -299,13 +413,21 @@ class PolicyTrainer:
                 perm = torch.randperm(N, device=Y.device)
                 for i in range(cfg.critic_minibatches):
                     idx = perm[i * mb : (i + 1) * mb]
-                    closs = torch.nn.functional.mse_loss(self.critic(*(x[idx] for x in X)), Y[idx])
+                    pred = self.critic(*(x[idx] for x in X))
+                    if W is None:
+                        closs = torch.nn.functional.mse_loss(pred, Y[idx])
+                    else:
+                        closs = (W[idx] * (pred - Y[idx]) ** 2).sum() / (W[idx].sum() + 1e-6)
                     self.critic_opt.zero_grad(set_to_none=True)
                     closs.backward()
                     allreduce_grads(self.critic)
-                    torch.nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.critic_grad_clip)
+                    cgn = torch.nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.critic_grad_clip)
+                    if cfg.skip_nonfinite and not bool(torch.isfinite(cgn)):
+                        self.critic_opt.zero_grad(set_to_none=True)
+                        self.nonfinite_skips += 1
+                        print(f"[WARN] non-finite critic gradient (#{self.nonfinite_skips}), minibatch skipped", flush=True)
+                        continue
                     self.critic_opt.step()
             m["critic_loss"] = closs.detach()
-            m["critic_value_mean"] = values.mean()
             m["critic_target_mean"] = targets.mean()
         return {k: float(v) for k, v in m.items()}

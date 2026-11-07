@@ -175,6 +175,9 @@ class MotionLibrary:
         local_bin = torch.arange(self.num_bins, device=self.device) - self.clip_bin_offset[bin_clip]
         self.bin_start = self.clip_start[bin_clip] + local_bin * self.bin_frames
         self.bin_end = torch.minimum(self.bin_start + self.bin_frames, self.clip_start[bin_clip] + self.clip_len[bin_clip])
+        self.bin_clip = bin_clip
+        # set by the motion command from freeze_clip_end (v2): goal frames past the clip end get zero velocities
+        self.freeze_end = False
 
     # ------------------------------------------------------------------ per-frame access
 
@@ -203,17 +206,29 @@ class MotionLibrary:
     def last_frame_of(self, frame: torch.Tensor) -> torch.Tensor:
         return self.clip_last[self.frame_clip[frame]]
 
-    def goal_window(self, frame: torch.Tensor, k: int) -> torch.Tensor:
-        """(N, k*goal_dim): goal features of frames frame..frame+k-1; past the clip end the last frame is repeated."""
+    def goal_window(self, frame: torch.Tensor, k: int, beyond: torch.Tensor | None = None) -> torch.Tensor:
+        """(N, k*goal_dim): goal features of frames frame..frame+k-1; past the clip end the last frame is repeated.
+        beyond (N,): steps already taken past the clip end (frame is then the last frame; imagination / evaluation hold mode).
+        With freeze_end the frames past the end get zero velocities (traj goal only)."""
         last = self.last_frame_of(frame)
-        idx = torch.minimum(frame[:, None] + torch.arange(k, device=self.device)[None, :], last[:, None])
+        pos = frame[:, None] + torch.arange(k, device=self.device)[None, :]
+        if beyond is not None:
+            pos = pos + beyond[:, None]
+        idx = torch.minimum(pos, last[:, None])
+        feat = self.goal_feat[idx]
+        if self.freeze_end and self.goal_mode != "paper":  # traj features = [root lin vel 3, root ang vel 3, joint pos NJ, joint vel NJ]
+            nj = (feat.shape[-1] - 6) // 2
+            vel = torch.zeros(feat.shape[-1], dtype=torch.bool, device=self.device)
+            vel[:6] = True
+            vel[6 + nj :] = True
+            feat = torch.where((pos > last[:, None])[..., None] & vel, torch.zeros_like(feat), feat)
         if self.goal_mode == "paper":
-            return self.goal_feat[idx].reshape(frame.shape[0], k * self.goal_dim)
+            return feat.reshape(frame.shape[0], k * self.goal_dim)
         base = torch.maximum(frame - 1, self.clip_start[self.frame_clip[frame]])
         hq = yaw_quat(self._ref[base, 3:7])[:, None, :].expand(-1, k, -1)
         dp = quat_apply_inverse(hq, self._ref[idx, 0:3] - self._ref[base, None, 0:3])
         rot = rot6d_from_quat(quat_mul(quat_conjugate(hq), self._ref[idx, 3:7]))
-        return torch.cat([dp, rot, self.goal_feat[idx]], dim=-1).reshape(frame.shape[0], k * self.goal_dim)
+        return torch.cat([dp, rot, feat], dim=-1).reshape(frame.shape[0], k * self.goal_dim)
 
     def summary(self) -> str:
         hours = self.num_frames / 50.0 / 3600.0

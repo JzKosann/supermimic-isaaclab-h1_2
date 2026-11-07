@@ -7,6 +7,14 @@ clip_end is set and the next step ends the episode as a time-out (no playback ac
 Return-based reset sampling (SuperMimic-Reproduced plan D14): every clip is split into 1 s bins; at the end of an episode the discounted return-to-go of each step is computed backwards
 and folded into an EMA of its bin (alpha=0.05, initial value G_max=0.1/(1-gamma)=10); reset distribution = 50% uniform + 40% softmax(-25 G_b/G_max)
 + 10% historical softmax weights (EMA alpha=0.01). For episodes truncated by the 10 s time-out, steps less than 100 steps before the truncation are not added to the EMA.
+v2 uses bin_estimator="count" instead (see bin_estimator.py): the old estimate makes the last second of every clip look hardest.
+
+v2 clip-end handling (freeze_clip_end, following realmimic's env.freeze_clip_end): past the clip end the reference stays at the last
+frame with zero velocity, so goal-window frames beyond the end have their velocity features zeroed (traj goal only), and imagination
+may roll past the end (imagination.py). Without it the policy only ever sees a last-frame target that still carries the velocities
+of a moving reference, and learns to fall right after the clip ends.
+Evaluation-only hold mode (end_hold_steps > 0): after the clip end the reference stays at the last frame for end_hold_steps more
+steps before the episode ends (as on a robot, where the reference simply stops); the goal window then lies entirely past the end.
 """
 
 from __future__ import annotations
@@ -24,6 +32,7 @@ from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_from_euler_xyz, sample_uniform
 
+from .bin_estimator import episode_returns_to_go, fold_into_bins, initial_return
 from .heads import anchor_relative_obs, root_ori_relative_obs
 from .kinematics import H1_2_URDF, UrdfKinematics
 from .motion_library import MotionLibrary, discover_npz
@@ -60,19 +69,25 @@ class MultiClipMotionCommand(CommandTerm):
             files, self.fk, self.body_names, self.robot.data.default_joint_pos[0], self.device, cfg.bin_frames,
             goal_mode=cfg.goal_mode,
         )  # fmt: skip
+        self.library.freeze_end = cfg.freeze_clip_end
         print(f"[INFO] SuperMimic {self.library.summary()}")
         lib = self.library
 
         n = self.num_envs
         self.frame = torch.zeros(n, dtype=torch.long, device=self.device)
         self.clip_end = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.hold = torch.zeros(n, dtype=torch.long, device=self.device)  # steps held at the last frame after the clip end (only > 0 with end_hold_steps)
         self.forced_frame = torch.full((n,), -1, dtype=torch.long, device=self.device)  # for evaluation: the next reset starts exactly at this frame
         self._errors_stamp = -1
         self._errors: dict[str, torch.Tensor] = {}
 
         # return-based reset sampling
-        self.bin_return = torch.full((lib.num_bins,), cfg.g_max, device=self.device)
+        self.bin_return = torch.full((lib.num_bins,), initial_return(cfg.bin_estimator, cfg.g_max), device=self.device)
+        self.bin_count = torch.zeros(lib.num_bins, device=self.device)  # visits per bin (bin_estimator = count)
         self.bin_memory = torch.full((lib.num_bins,), 1.0 / lib.num_bins, device=self.device)
+        # the last bin of every clip, and the share of the reset probability that falls into it (logged as sampler/last_bin_share)
+        self._bin_is_last = lib.bin_end == (lib.clip_start + lib.clip_len)[lib.bin_clip]
+        self.last_bin_share = 0.0
         self.max_ep_steps = min(int(math.ceil(env.cfg.episode_length_s / env.step_dt)) + 2, cfg.max_logged_steps)
         self.ep_rewards = torch.zeros(n, self.max_ep_steps, device=self.device)
         self.ep_bins = torch.zeros(n, self.max_ep_steps, dtype=torch.long, device=self.device)
@@ -90,7 +105,8 @@ class MultiClipMotionCommand(CommandTerm):
 
     @property
     def goal(self) -> torch.Tensor:
-        return self.library.goal_window(self.frame, self.cfg.future_frames)
+        # hold = 0 is the same as not passing it; during the hold the whole window lies past the clip end (as `beyond` in imagination)
+        return self.library.goal_window(self.frame, self.cfg.future_frames, self.hold)
 
     @property
     def ref_body_pos_w(self) -> torch.Tensor:
@@ -194,23 +210,13 @@ class MultiClipMotionCommand(CommandTerm):
         T = int(lens.max())
         r = self.ep_rewards[env_ids, :T].double()
         bins = self.ep_bins[env_ids, :T]
-        tmask = torch.arange(T, device=self.device)[None, :] < lens[:, None]
-        gp = self._gamma_pow[:T]
-        rtg = torch.flip(torch.cumsum(torch.flip(r * tmask * gp[None, :], [1]), 1), [1]) / gp[None, :]
         tm = getattr(self._env, "termination_manager", None)
         terminated = tm.terminated[env_ids] if tm is not None else torch.ones_like(lens, dtype=torch.bool)
-        truncated = ~terminated & ~self.clip_end[env_ids]
-        remaining = lens[:, None] - torch.arange(T, device=self.device)[None, :]
-        tmask = tmask & ~(truncated[:, None] & (remaining < cfg.min_remaining_steps))
-        valid = tmask.reshape(-1)
-        b = bins.reshape(-1)[valid]
-        g = rtg.reshape(-1)[valid].float()
-        if b.numel() == 0:
-            return
-        sums = torch.zeros(self.library.num_bins, device=self.device).index_add_(0, b, g)
-        cnts = torch.zeros(self.library.num_bins, device=self.device).index_add_(0, b, torch.ones_like(g))
-        touched = cnts > 0
-        self.bin_return[touched] = (1 - cfg.ema_alpha) * self.bin_return[touched] + cfg.ema_alpha * sums[touched] / cnts[touched]
+        rtg, tmask = episode_returns_to_go(
+            r, lens, terminated, self.clip_end[env_ids], self._gamma_pow, cfg.gamma, cfg.g_max, cfg.bin_estimator,
+            cfg.bootstrap_steps, cfg.min_remaining_steps,
+        )  # fmt: skip
+        fold_into_bins(self.bin_return, self.bin_count, bins, rtg, tmask, cfg.bin_estimator, cfg.ema_alpha, cfg.g_max)
 
     def _sample_frames(self, n: int) -> torch.Tensor:
         lib, cfg = self.library, self.cfg
@@ -223,6 +229,7 @@ class MultiClipMotionCommand(CommandTerm):
         self.bin_memory = (1 - cfg.memory_alpha) * self.bin_memory + cfg.memory_alpha * hard
         p = cfg.uniform_ratio / lib.num_bins + cfg.hard_ratio * hard + cfg.memory_ratio * self.bin_memory / self.bin_memory.sum()
         p = p / p.sum()
+        self.last_bin_share = float(p[self._bin_is_last].sum())
         b = torch.multinomial(p, n, replacement=True)
         f = lib.bin_start[b] + (torch.rand(n, device=self.device) * (lib.bin_end[b] - lib.bin_start[b]).float()).long()
         f = torch.maximum(torch.minimum(f, lib.last_frame_of(f) - 2), lib.clip_start[lib.frame_clip[f]])
@@ -243,6 +250,7 @@ class MultiClipMotionCommand(CommandTerm):
         forced = self.forced_frame[env_ids]
         self.frame[env_ids] = torch.where(forced >= 0, forced, self._sample_frames(len(env_ids)))
         self.clip_end[env_ids] = False
+        self.hold[env_ids] = 0
 
         r = self.library.ref(self.frame[env_ids])
         n = len(env_ids)
@@ -274,8 +282,12 @@ class MultiClipMotionCommand(CommandTerm):
         last = self.library.last_frame_of(self.frame)
         self.frame += 1
         over = self.frame > last
-        self.clip_end |= over
         self.frame = torch.where(over, last, self.frame)
+        if self.cfg.end_hold_steps > 0:  # evaluation: hold the last frame for end_hold_steps more steps before the clip counts as finished
+            self.hold += over.long()
+            self.clip_end |= self.hold > self.cfg.end_hold_steps
+        else:
+            self.clip_end |= over
         if self.ghost is not None:
             self._write_ghost(None)
 
@@ -319,6 +331,8 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
     body_names: list[str] = MISSING
     future_frames: int = 10
     goal_mode: str = "paper"  # paper (v0) | traj (v1), see motion_library.py
+    freeze_clip_end: bool = False  # v2: past the clip end the reference stops (zero goal velocities); traj goal only
+    end_hold_steps: int = 0  # evaluation only: steps the last frame is held after the clip end before the episode ends (0 = end at once)
     bin_frames: int = 50
     pose_range: dict[str, tuple[float, float]] = {}
     velocity_range: dict[str, tuple[float, float]] = {}
@@ -330,9 +344,11 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
     softmax_temp: float = 25.0
     g_max: float = 10.0
     gamma: float = 0.99
+    bin_estimator: str = "ema"  # ema (v0 / v1) | count (v2), see bin_estimator.py
+    bootstrap_steps: int = 50  # count only: the mean reward of the last steps gives the continuation value
     ema_alpha: float = 0.05
     memory_alpha: float = 0.01
-    min_remaining_steps: int = 100
+    min_remaining_steps: int = 100  # ema only
     max_logged_steps: int = 1024
     ref_visualizer_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(
         prim_path="/Visuals/Command/supermimic_ref",

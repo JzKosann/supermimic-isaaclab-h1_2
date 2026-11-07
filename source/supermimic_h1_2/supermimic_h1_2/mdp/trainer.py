@@ -7,6 +7,9 @@ Recipes (chosen by the recipe field of the env cfg, see apply_recipe):
     v0  the paper + the choices of SuperMimic-Reproduced
     v1  v0 + the parts of supermimic_vibed that worked better: 500 world-model-only updates at the start, imagination starts never cross
         the clip end, analytic soft termination, tracking errors in the critic; the reference-orientation observation and the trajectory goal live in the env cfg (tasks/h1_2_env_cfg.py)
+    v2  v1 + Uni-SuperMimic's input normalisation (RunningNorm), learning rate 4e-4 without the sqrt(#GPUs) scaling, policy EMA 0.995,
+        + the stability fixes of imagination.py (paper_clip, value_cap, absorbing state, survival-weighted critic, non-finite skip);
+        the env side of v2 (count bin estimator, freeze_clip_end, action clip, joint-target guard) lives in the env cfg
 """
 
 from __future__ import annotations
@@ -30,6 +33,12 @@ from .rewards import REWARD
 from .state import StateIO
 from .world_model import WMTrainerCfg, WorldModel, WorldModelCfg, WorldModelTrainer
 
+# metrics whose largest absolute value within a log interval is also logged (<name>_peak): the interval mean dilutes a single outlier
+PEAK_METRICS = {
+    "policy/action_abs_max", "policy/imag_state_abs_max", "policy/imag_reward_min", "policy/policy_grad_norm",
+    "policy/critic_value_max", "policy/critic_loss",
+}  # fmt: skip
+
 
 @dataclass
 class ScheduleCfg:
@@ -38,6 +47,8 @@ class ScheduleCfg:
     warmup_iterations: int = 40  # fill k-step windows before the first update
     lr_final_ratio: float = 0.03
     lr_decay_fraction: float = 250_000 / 320_000
+    lr_decay_iterations: int | None = None  # absolute length of the cosine decay (simulator steps); overrides total x fraction (v2)
+    lr_world_scaling: bool = True  # multi-GPU learning rate x sqrt(#GPUs) (paper); off in v2
     log_interval: int = 50
     checkpoint_interval: int = 4000
     max_hours: float | None = None
@@ -59,16 +70,29 @@ class TrainCfg:
 def apply_recipe(cfg: TrainCfg, recipe: str) -> None:
     if recipe == "v0":
         return
-    if recipe != "v1":
+    if recipe not in ("v1", "v2"):
         raise ValueError(f"unknown recipe {recipe}")
     cfg.schedule.wm_only_updates = 500
     cfg.policy_trainer.start_within_clip = True
     cfg.policy_trainer.analytic_termination = True
     cfg.policy_trainer.critic_tracking_features = True
+    if recipe == "v2":
+        cfg.policy.input_norm = True
+        cfg.critic.input_norm = True
+        cfg.wm_trainer.lr = cfg.policy_trainer.lr = cfg.policy_trainer.critic_lr = 4e-4
+        cfg.schedule.lr_world_scaling = False
+        cfg.schedule.lr_decay_iterations = int(250_000 / cfg.schedule.updates_per_env_step)  # = Uni's 250k updates
+        pt = cfg.policy_trainer
+        pt.policy_ema = 0.995
+        pt.paper_clip = True
+        pt.value_cap = True
+        pt.absorb_thr = 1e-3
+        pt.critic_survival_weight = True
+        pt.skip_nonfinite = True
 
 
-def cosine_lr(step: int, total: int, base: float, final_ratio: float, decay_fraction: float) -> float:
-    decay = max(1, int(total * decay_fraction))
+def cosine_lr(step: int, decay: int, base: float, final_ratio: float) -> float:
+    decay = max(1, decay)
     if step >= decay:
         return base * final_ratio
     return base * (final_ratio + (1.0 - final_ratio) * 0.5 * (1.0 + math.cos(math.pi * step / decay)))
@@ -110,9 +134,11 @@ def build_networks(cfg: TrainCfg, env, device):
     cfg.policy.anchor_obs = bool(env.cfg.anchor_obs)
     cfg.policy.ref_ori_obs = getattr(env.cfg.observations.policy, "ref_root_ori", None) is not None
     cfg.policy.goal_mode = cmd.cfg.goal_mode
+    act = env.action_manager.get_term("joint_pos")
     heads = AnalyticHeads(
         cmd.fk, cmd.body_names, cmd.cfg.anchor_body_name,
         robot.data.soft_joint_pos_limits[0].clone(), robot.data.default_joint_pos[0].clone(),
+        action_bounds=getattr(act, "action_bounds", None), action_scale=act.cfg.scale,
     )  # fmt: skip
     wm = WorldModel(cfg.world_model, heads, device)
     policy = Policy(cfg.policy).to(device)
@@ -131,7 +157,7 @@ class Trainer:
         self.is_main = rank == 0
         self.world = world_size()
         self.device = env.device
-        if self.world > 1:  # paper: 2 GPUs -> learning rate x sqrt(2)
+        if self.world > 1 and cfg.schedule.lr_world_scaling:  # paper: 2 GPUs -> learning rate x sqrt(2)
             for c in (cfg.wm_trainer, cfg.policy_trainer):
                 c.lr *= self.world**0.5
             cfg.policy_trainer.critic_lr *= self.world**0.5
@@ -142,6 +168,8 @@ class Trainer:
             broadcast_module(m)
         self.wm_trainer = WorldModelTrainer(self.wm, self.lib, cfg.wm_trainer)
         self.policy_trainer = PolicyTrainer(self.wm, self.policy, self.critic, self.lib, cfg.policy_trainer)
+        if self.is_main:
+            self.policy_trainer.outlier_dir = Path(log_dir) / "outliers"
 
         spec = self.wm.spec
         nj = self.heads.nj
@@ -162,6 +190,7 @@ class Trainer:
         self.num_updates = 0
         self._utd_acc = 0.0
         self._last_lr = cfg.wm_trainer.lr
+        self.init_from_path: str | None = None  # recorded in checkpoints (fine-tuning chain)
 
     # ------------------------------------------------------------------ checkpoint
 
@@ -175,33 +204,74 @@ class Trainer:
                 "wm": self.wm.state_dict(),
                 "policy": self.policy.state_dict(),
                 "critic": self.critic.state_dict(),
+                **self._ema_state(),
                 "wm_opt": self.wm_trainer.opt.state_dict(),
                 "policy_opt": self.policy_trainer.opt.state_dict(),
                 "critic_opt": self.policy_trainer.critic_opt.state_dict(),
                 "bin_return": self.cmd.bin_return,
                 "bin_memory": self.cmd.bin_memory,
+                "bin_count": self.cmd.bin_count,
+                "bin_estimator": self.cmd.cfg.bin_estimator,
                 "config": asdict(self.cfg),
                 "task": self.task,
                 "recipe": self.env.cfg.recipe,
                 "joint_names": list(self.env.scene["robot"].joint_names),
+                "init_from": self.init_from_path,
             },
             self.log_dir / name,
         )
 
+    def _ema_state(self) -> dict:
+        """v2: the EMA policy, stored as a state_dict in the same format as "policy" (play / evaluation load it directly) + #averages."""
+        ema = self.policy_trainer.policy_ema
+        if ema is None:
+            return {}
+        return {"policy_ema": ema.module.state_dict(), "policy_ema_n": int(ema.n_averaged)}
+
     def load(self, path: str) -> None:
+        """Resumes a run: weights, optimizers, sampler and counters."""
         ck = torch.load(path, map_location=self.device, weights_only=False)
         self.wm.load_state_dict(ck["wm"])
         self.policy.load_state_dict(ck["policy"])
         self.critic.load_state_dict(ck["critic"])
+        ema = self.policy_trainer.policy_ema
+        if ema is not None:
+            if "policy_ema" in ck:
+                ema.module.load_state_dict(ck["policy_ema"])
+                ema.n_averaged.fill_(ck["policy_ema_n"])
+            else:  # checkpoint without EMA: start averaging from the current policy
+                ema.module.load_state_dict(self.policy.state_dict())
+                ema.n_averaged.zero_()
         self.wm_trainer.opt.load_state_dict(ck["wm_opt"])
         self.policy_trainer.opt.load_state_dict(ck["policy_opt"])
         self.policy_trainer.critic_opt.load_state_dict(ck["critic_opt"])
-        if ck["bin_return"].shape == self.cmd.bin_return.shape:
+        same_estimator = ck.get("bin_estimator", "ema") == self.cmd.cfg.bin_estimator
+        if same_estimator and ck["bin_return"].shape == self.cmd.bin_return.shape:
             self.cmd.bin_return.copy_(ck["bin_return"])
             self.cmd.bin_memory.copy_(ck["bin_memory"])
+            if "bin_count" in ck:
+                self.cmd.bin_count.copy_(ck["bin_count"])
+        else:
+            print("[WARN] sampler state in the checkpoint does not match this library / estimator, sampler restarts")
         self.iteration = int(ck["iteration"])
         self.num_updates = int(ck["num_updates"])
+        self.init_from_path = ck.get("init_from")
         print(f"[INFO] resumed from {path} at iteration {self.iteration}")
+
+    def init_from(self, path: str) -> None:
+        """Fine-tuning: takes the weights of a checkpoint with the same network shapes (the policy from its EMA if present);
+        iteration counter, optimizers and sampler start fresh (so --wm_only_updates first re-fits the world model to the new data)."""
+        ck = torch.load(path, map_location=self.device, weights_only=False)
+        self.policy.load_state_dict(ck.get("policy_ema", ck["policy"]))
+        ema = self.policy_trainer.policy_ema
+        if ema is not None:
+            ema.module.load_state_dict(self.policy.state_dict())
+            ema.n_averaged.zero_()
+        self.wm.load_state_dict(ck["wm"])
+        self.critic.load_state_dict(ck["critic"])
+        self.init_from_path = os.path.abspath(path)
+        if self.is_main:
+            print(f"[INFO] initialised from {path} (iteration {ck['iteration']}); optimizers and sampler start fresh", flush=True)
 
     # ------------------------------------------------------------------ main loop
 
@@ -214,6 +284,7 @@ class Trainer:
         fin = [0.0, 0.0, 0.0]  # sum of normalised returns, number of episodes, sum of lengths (this log interval)
         agg: dict[str, float] = {}  # sums of each metric within this log interval
         agg_n: dict[str, int] = {}  # and their counts (no policy metrics during warm-up, so each metric is counted separately)
+        self._peak: dict[str, float] = {}  # largest |value| of PEAK_METRICS within this log interval
         env_log: dict[str, float] = {}
         env_log_n = 0
         timers = {"sim": 0.0, "wm": 0.0, "policy": 0.0}
@@ -222,12 +293,14 @@ class Trainer:
         base_lr = cfg.wm_trainer.lr
         pol_ratio = cfg.policy_trainer.lr / base_lr
         critic_ratio = cfg.policy_trainer.critic_lr / base_lr
+        lr_decay = sch.lr_decay_iterations or int(sch.total_iterations * sch.lr_decay_fraction)
         max_r = REWARD.max_step_reward
 
         while self.iteration < sch.total_iterations:
             # ---- (1) collect one control step
             t0 = time.perf_counter()
             with torch.no_grad():
+                self.policy.update_norm(obs["policy"], obs["goal"])  # v2 only; as Uni: update the statistics, then act
                 action = self.policy(obs["policy"], obs["goal"])
             obs, rew, term, tout, extras = env.step(action)
             self.collector.after_step()
@@ -253,7 +326,7 @@ class Trainer:
                 self._utd_acc += sch.updates_per_env_step
                 while self._utd_acc >= 1.0:
                     self._utd_acc -= 1.0
-                    lr = cosine_lr(self.iteration, sch.total_iterations, base_lr, sch.lr_final_ratio, sch.lr_decay_fraction)
+                    lr = cosine_lr(self.iteration, lr_decay, base_lr, sch.lr_final_ratio)
                     self.wm_trainer.set_lr(lr)
                     self.policy_trainer.set_lr(lr * pol_ratio, lr * critic_ratio)
                     t0 = time.perf_counter()
@@ -270,6 +343,8 @@ class Trainer:
                     for k, v in [(f"wm/{k}", v) for k, v in m_wm.items()] + [(f"policy/{k}", v) for k, v in m_pi.items()]:
                         agg[k] = agg.get(k, 0.0) + v
                         agg_n[k] = agg_n.get(k, 0) + 1
+                        if k in PEAK_METRICS:
+                            self._peak[k] = max(self._peak.get(k, 0.0), abs(float(v)))
                     self._last_lr = lr
 
             # ---- logging / checkpoints
@@ -280,6 +355,7 @@ class Trainer:
                 last_log = time.time()
                 fin = [0.0, 0.0, 0.0]
                 agg, agg_n, env_log, env_log_n = {}, {}, {}, 0
+                self._peak = {}
                 timers = {k: 0.0 for k in timers}
             if self.iteration % sch.checkpoint_interval == 0:
                 self.save("ckpt_latest.pt")
@@ -297,6 +373,7 @@ class Trainer:
         it = self.iteration
         elapsed = time.time() - t_start
         s: dict[str, float] = {k: v / agg_n[k] for k, v in agg.items()}
+        s.update({f"{k}_peak": v for k, v in self._peak.items()})
         if agg:
             s["lr"] = self._last_lr
         tr = fin[0] / fin[1] if fin[1] > 0 else float("nan")
@@ -317,6 +394,11 @@ class Trainer:
         s["time/hours"] = elapsed / 3600
         s["time/updates"] = self.num_updates
         s["sampler/bin_return_mean"] = float(self.cmd.bin_return.mean())
+        # share of the reset probability that falls into the last 1 s of a clip: should stay close to #clips / #bins (the share of last
+        # bins, ~0.005 on LAFAN1); much higher means the sampler prefers clip endings (the bias of the "ema" estimator)
+        s["sampler/last_bin_share"] = self.cmd.last_bin_share
+        # share of bins never visited by an episode (count estimator); falls from 1 towards 0 as the whole library gets visited
+        s["sampler/untouched_frac"] = float((self.cmd.bin_count == 0).float().mean())
         if self.logger is not None:
             self.logger.log(s, it)
         dt = max(time.time() - last_log, 1e-6)

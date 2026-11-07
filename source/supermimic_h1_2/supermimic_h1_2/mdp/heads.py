@@ -13,7 +13,7 @@ import torch
 
 from .kinematics import UrdfKinematics
 from .motion_library import MotionLibrary
-from .rewards import REWARD, TrackingRewardCfg, reanchor_reference, tracking_sq_errors, weighted_terms
+from .rewards import REWARD, TrackingRewardCfg, reanchor_reference, target_overshoot, tracking_sq_errors, weighted_terms
 from .rotations import (
     heading_yaw,
     projected_gravity,
@@ -94,6 +94,8 @@ class AnalyticHeads:
         soft_limits: torch.Tensor,
         default_joint_pos: torch.Tensor,
         reward_cfg: TrackingRewardCfg = REWARD,
+        action_bounds: torch.Tensor | None = None,
+        action_scale: float = 0.25,
     ):
         self.fk = fk
         self.nj = len(fk.joint_names)
@@ -102,6 +104,15 @@ class AnalyticHeads:
         self.soft_limits = soft_limits
         self.default_joint_pos = default_joint_pos
         self.reward_cfg = reward_cfg
+        # v2 joint-target guard (NJ,2) in action units, from NoisyJointPositionAction.action_bounds; None = no guard
+        self.action_bounds = action_bounds
+        self.action_scale = action_scale
+
+    def exec_action(self, a: torch.Tensor) -> torch.Tensor:
+        """The action actually executed in imagination (fed to the world model): clamped to the guard, like executed_raw in Isaac."""
+        if self.action_bounds is None:
+            return a
+        return a.clamp(self.action_bounds[:, 0], self.action_bounds[:, 1])
 
     def robot_bodies(self, s: torch.Tensor) -> dict[str, torch.Tensor]:
         p, q, qj, v, w_b, qd = split_state(s, self.nj)
@@ -117,7 +128,8 @@ class AnalyticHeads:
             ref.body_pos_w, ref.body_quat_w, ref.body_lin_vel_w, ref.body_ang_vel_w, self.anchor_index,
         )  # fmt: skip
         joint_pos = s_next[..., 7 : 7 + self.nj]
-        return weighted_terms(err, action, prev_action, joint_pos, self.soft_limits, self.reward_cfg)
+        over = None if self.action_bounds is None else target_overshoot(action, self.action_bounds, self.action_scale)
+        return weighted_terms(err, action, prev_action, joint_pos, self.soft_limits, self.reward_cfg, over)
 
     @staticmethod
     def termination_features(s: torch.Tensor, ref_root_pos: torch.Tensor, ref_root_quat: torch.Tensor) -> torch.Tensor:

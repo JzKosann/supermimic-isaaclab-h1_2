@@ -1,9 +1,9 @@
 # Usage (inside docker/):
 #   docker compose build
 #   docker compose run --rm prepare-data                                          # download the model / data and convert to npz (once)
-#   GPU=0 TASK=Tracking-Flat-H1_2-SuperMimic-v1 RUN_NAME=lafan1_v1 docker compose up -d train
+#   GPU=0 RUN_NAME=lafan1_v2 docker compose up -d train                            # TASK defaults to ...-SuperMimic-v2
 #   resume: GPU=0 RESUME=/workspace/supermimic/logs/supermimic/<run>/ckpt_latest.pt docker compose up -d train
-#   evaluate: GPU=0 CKPT=/workspace/supermimic/logs/supermimic/<run> docker compose run --rm eval
+#   evaluate: GPU=0 CKPT=/workspace/supermimic/logs/supermimic/<run> EXTRA_ARGS="--ema" docker compose run --rm eval
 #   wandb: WANDB_API_KEY=... LOGGER=wandb docker compose up -d train
 # Logs end up on the host in ../logs/supermimic/<date>_<RUN_NAME>/.
 
@@ -45,7 +45,7 @@ services:
     container_name: supermimic-train-gpu${GPU:-0}
     command: >-
       scripts/supermimic/train.py
-      --task ${TASK:-Tracking-Flat-H1_2-SuperMimic-v1}
+      --task ${TASK:-Tracking-Flat-H1_2-SuperMimic-v2}
       --headless
       --num_envs ${NUM_ENVS:-4096}
       --seed ${SEED:-0}

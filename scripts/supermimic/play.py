@@ -5,6 +5,7 @@ SuperMimic does not use rsl_rl (different policy class), so Isaac Lab's rsl_rl p
 Usage (from the repository root):
     python scripts/supermimic/play.py --ckpt logs/supermimic/<run>/ckpt_0040000.pt
     python scripts/supermimic/play.py --ckpt logs/supermimic/<run> --num_envs 4 --include walk    # directory = latest checkpoint
+    v2 checkpoints also store an EMA policy (usually the better one): add --ema.
 """
 
 import argparse
@@ -18,6 +19,7 @@ parser.add_argument("--motion_dir", type=str, default=None)
 parser.add_argument("--include", type=str, nargs="*", default=None, help="only play clips whose file name contains one of these substrings")
 parser.add_argument("--follow_env", type=int, default=0, help="env the camera follows first")
 parser.add_argument("--real_time", "--real-time", action="store_true", help="play at real-time speed (50 Hz)")
+parser.add_argument("--ema", action="store_true", help="play the EMA policy of a v2 checkpoint")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 app_launcher = AppLauncher(args_cli)
@@ -55,7 +57,7 @@ def main():
     env_cfg.enable_play_viz()
     env = gym.make(task, cfg=env_cfg).unwrapped
     policy = Policy(PolicyCfg(**ck["config"]["policy"])).to(device)
-    policy.load_state_dict(ck["policy"])
+    policy.load_state_dict(ck["policy_ema" if args_cli.ema else "policy"])
     policy.eval()
 
     obs, _ = env.reset()

@@ -1,13 +1,16 @@
 """SuperMimic training (world model + BPTT, no rsl_rl). Environments: tasks/h1_2_env_cfg.py; algorithm: mdp/.
 
 Usage (from the repository root):
-    single GPU (paper Fig. 4a configuration: 40 LAFAN1 clips, 4096 envs, imagination batch 4096, H=32, UTD 0.4, 320k iterations):
+    single GPU, v2 recipe (default task; 40 LAFAN1 clips, 4096 envs, imagination batch 4096, H=32, UTD 0.4, 320k iterations):
         python scripts/supermimic/train.py --headless --run_name lafan1
+    paper configuration (Fig. 4a): --task Tracking-Flat-H1_2-SuperMimic-v0
     with anchor-relative pose observation (experiment e3 of SuperMimic-Reproduced, deviates from the paper): --task Tracking-Flat-H1_2-SuperMimic-Anchor-v0
     v1 (v0 + the improvements of supermimic_vibed, see tasks/h1_2_env_cfg.py / mdp/trainer.py): --task Tracking-Flat-H1_2-SuperMimic-v1
-    multi-GPU (one Isaac instance + 4096 envs per GPU, gradient all-reduce, learning rate x sqrt(#GPUs); untested):
+    multi-GPU (one Isaac instance + 4096 envs per GPU, gradient all-reduce; v0 / v1 scale the learning rate by sqrt(#GPUs), v2 does not):
         python -m torch.distributed.run --nnodes=1 --nproc_per_node=4 scripts/supermimic/train.py --headless --distributed
     resume: --resume logs/supermimic/<run>/ckpt_latest.pt (logs continue in the same directory)
+    fine-tune: --init_from <ckpt.pt> --include <clips> (new run directory; weights from the checkpoint, the policy from its EMA if
+        present; iteration counter, optimizers and sampler start fresh, and v1 / v2 first re-fit only the world model for 500 updates)
     smoke test (8 GB GPU): --num_envs 64 --small_nets --policy_batch 256 --wm_batch 256 --total_iterations 600 --include walk1
 Logs in logs/supermimic/<date>_<run_name>/: config.json, tb/, ckpt_XXXXXXX.pt (every 4000 iterations), ckpt_latest.pt.
 Evaluation: scripts/supermimic/eval_benchmark.py --ckpt <checkpoint or run directory>.
@@ -18,7 +21,7 @@ import argparse
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Train SuperMimic (world model + BPTT) on H1-2.")
-parser.add_argument("--task", type=str, default="Tracking-Flat-H1_2-SuperMimic-v0")
+parser.add_argument("--task", type=str, default="Tracking-Flat-H1_2-SuperMimic-v2")
 parser.add_argument("--num_envs", type=int, default=4096, help="envs per GPU (paper: 4096)")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--run_name", type=str, default="lafan1")
@@ -30,11 +33,13 @@ parser.add_argument("--policy_batch", type=int, default=None, help="imagination 
 parser.add_argument("--wm_batch", type=int, default=None, help="world-model windows per batch (paper: 2048)")
 parser.add_argument("--horizon", type=int, default=None, help="imagination horizon H (paper: 32)")
 parser.add_argument("--replay_capacity", type=int, default=None, help="replay steps per env (paper: 1000)")
+parser.add_argument("--wm_only_updates", type=int, default=None, help="initial updates that train only the world model (v1 / v2: 500)")
 parser.add_argument("--compile", type=str, default="default", help="torch.compile mode; none disables it")
 parser.add_argument("--small_nets", action="store_true", help="small networks, for smoke tests only")
 parser.add_argument("--checkpoint_interval", type=int, default=None)
 parser.add_argument("--log_interval", type=int, default=None)
 parser.add_argument("--resume", type=str, default=None)
+parser.add_argument("--init_from", type=str, default=None, help="fine-tune: start from the weights of this checkpoint (same task / network shapes)")
 parser.add_argument("--distributed", action="store_true", default=False)
 parser.add_argument("--logger", type=str, default="tensorboard", choices=["tensorboard", "wandb"])
 parser.add_argument("--log_project_name", type=str, default="supermimic-h1_2")
@@ -100,6 +105,8 @@ def main():
     env_cfg = parse_env_cfg(args_cli.task, device=device, num_envs=args_cli.num_envs)
     env_cfg.seed = cfg.seed + 1000 * rank
     apply_recipe(cfg, env_cfg.recipe)
+    if args_cli.wm_only_updates is not None:  # after apply_recipe, which sets it for v1 / v2
+        cfg.schedule.wm_only_updates = args_cli.wm_only_updates
     if args_cli.motion_dir:
         env_cfg.commands.motion.motion_dir = args_cli.motion_dir
     if args_cli.include:
@@ -118,10 +125,15 @@ def main():
         print(f"[INFO] logging to {log_dir}")
 
     trainer = Trainer(env, cfg, log_dir, rank, logger, task=args_cli.task)
-    if rank == 0:
-        save_config(cfg, log_dir, {"task": args_cli.task, "recipe": env.cfg.recipe, "anchor_obs": bool(env.cfg.anchor_obs), "world_size": world})
+    if args_cli.resume and args_cli.init_from:
+        raise ValueError("--resume and --init_from are exclusive")
     if args_cli.resume:
         trainer.load(args_cli.resume)
+    elif args_cli.init_from:
+        trainer.init_from(args_cli.init_from)
+    if rank == 0:
+        save_config(cfg, log_dir, {"task": args_cli.task, "recipe": env.cfg.recipe, "anchor_obs": bool(env.cfg.anchor_obs),
+                                   "world_size": world, "init_from": trainer.init_from_path})  # fmt: skip
     try:
         trainer.run()
     finally:

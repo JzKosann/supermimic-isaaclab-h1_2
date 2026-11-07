@@ -68,6 +68,24 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+### Uni-SuperMimic — Apache License 2.0
+
+<https://github.com/Motphys/Uni-SuperMimic>
+
+`RunningNorm` in `source/supermimic_h1_2/supermimic_h1_2/mdp/policy.py` and the v2 learning rate / policy-EMA settings
+follow `src/unisupermimic/rl/algos/supermimic/networks.py` and its training configuration (re-implemented here, with a
+multi-GPU statistics merge added). Copyright 2026 UniSuperMimic Authors. Licensed under the Apache License, Version 2.0
+(<http://www.apache.org/licenses/LICENSE-2.0>).
+
+### realmimic — Apache License 2.0
+
+<https://github.com/kevinhenryzz/realmimic>
+
+The "count" reset-sampling estimate in `source/supermimic_h1_2/supermimic_h1_2/mdp/bin_estimator.py`, the clip-end freeze
+(`freeze_clip_end`) and the value cap of the v2 recipe follow the algorithms described in realmimic's README and code
+(re-implemented here). Copyright 2026 Kevin Henry. Licensed under the Apache License, Version 2.0
+(<http://www.apache.org/licenses/LICENSE-2.0>).
+
 ### unitree_rl_lab — Apache License 2.0
 
 <https://github.com/unitreerobotics/unitree_rl_lab>

@@ -1,6 +1,6 @@
 """SuperMimic reproduction environments (arXiv:2610.28480; ported item by item from SuperMimic-Reproduced (mjlab / G1) to Isaac Lab / H1-2).
 gym ids: Tracking-Flat-H1_2-SuperMimic-v0 (paper observation), -Anchor-v0 (+ anchor-relative pose, deviates from the paper), -Eval-v0 / -Anchor-Eval-v0 (Appendix-F evaluation),
--v1 / -Eval-v1 (see the v1 notes at the end of this file).
+-v1 / -Eval-v1, -v2 / -Eval-v2 (see the v1 / v2 notes at the end of this file).
 Training does not use rsl_rl: scripts/supermimic/train.py (world model + BPTT); the algorithm and the environment terms live in supermimic_h1_2/mdp/.
 
 Robot UNITREE_H1_2_CFG (supermimic_h1_2/robots.py), action scale 0.25, 50 Hz control:
@@ -320,6 +320,35 @@ class H1_2SuperMimicV1EnvCfg(H1_2SuperMimicEnvCfg):
 
 @configclass
 class H1_2SuperMimicV1EvalEnvCfg(H1_2SuperMimicV1EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.num_envs = 40
+        self.make_eval()
+
+
+# v2: v1 (same observation and goal, so v1 and v2 policies have the same interface) + fixes for long or large-scale training.
+# Training side (trainer.apply_recipe / imagination.PolicyTrainerCfg): input normalisation, learning rate 4e-4, policy EMA,
+#   paper-scale gradient clipping, value cap, absorbing state, survival-weighted critic, non-finite gradient skip.
+# Environment side (here):
+#   bin_estimator="count"   the old return estimate makes the last second of every clip look hardest (commands.py / bin_estimator.py)
+#   freeze_clip_end         past the clip end the reference stops with zero velocity; imagination trains through the clip end
+#   action_clip 20          bound on the executed action in action units (keeps an exploding policy out of the replay buffer)
+#   guard_margin 0.02       joint targets clamped to the URDF limits - 0.02 rad (what a deployment-side guard does on H1-2);
+#                           the joint-limit reward also penalises how far the policy's targets go beyond it
+@configclass
+class H1_2SuperMimicV2EnvCfg(H1_2SuperMimicV1EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.recipe = "v2"
+        self.commands.motion.bin_estimator = "count"
+        self.commands.motion.freeze_clip_end = True
+        self.actions.joint_pos.action_clip = 20.0
+        self.actions.joint_pos.guard_margin = 0.02
+        self.rewards.joint_limit.func = sm.joint_limit_with_guard
+
+
+@configclass
+class H1_2SuperMimicV2EvalEnvCfg(H1_2SuperMimicV2EnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.scene.num_envs = 40

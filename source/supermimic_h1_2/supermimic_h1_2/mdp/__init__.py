@@ -2,8 +2,8 @@
 
 Ported module by module from SuperMimic-Reproduced (an independent mjlab / G1 reproduction) to Isaac Lab; dimensions parameterised for H1-2 (27 joints).
 Environment side (exported by this package, used by tasks/h1_2_env_cfg.py):
-    commands.py      multi-clip motion command, return-based reset sampling
-    actions.py       joint position action with execution noise + encoder bias
+    commands.py      multi-clip motion command, return-based reset sampling (bin_estimator.py), clip-end freeze / hold
+    actions.py       joint position action with execution noise + encoder bias (+ v2 action clip and joint-target guard)
     events.py        sim context xi and domain randomisation (friction / encoder bias / torso CoM)
     observations.py  policy / goal observation terms
     rewards.py       Table A.2 rewards (shared by the simulator and imagination)
@@ -23,6 +23,7 @@ from .events import get_sim_context, randomize_body_com, randomize_encoder_bias,
 from .observations import goal_anchor_ori, goal_anchor_pos, goal_future_frames, joint_pos_biased_rel, ref_root_ori
 from .rewards import (
     REWARD,
+    joint_limit_with_guard,
     motion_body_ang_vel,
     motion_body_lin_vel,
     motion_body_ori,

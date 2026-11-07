@@ -3,6 +3,7 @@
     Tracking-Flat-H1_2-SuperMimic-v0              paper observation (Table A.1)
     Tracking-Flat-H1_2-SuperMimic-Anchor-v0       + reference anchor pose relative to the robot (deviates from the paper)
     Tracking-Flat-H1_2-SuperMimic-v1              v0 + the improvements of supermimic_vibed (see the end of h1_2_env_cfg.py)
+    Tracking-Flat-H1_2-SuperMimic-v2              v1 + input normalisation, policy EMA and training-stability fixes (recommended)
     ...-Eval-vN                                   matching Appendix-F evaluation envs (eval_benchmark.py / play.py pick one from the checkpoint)
 """
 
@@ -17,6 +18,8 @@ _TASKS = {
     "Tracking-Flat-H1_2-SuperMimic-Anchor-Eval-v0": h1_2_env_cfg.H1_2SuperMimicAnchorEvalEnvCfg,
     "Tracking-Flat-H1_2-SuperMimic-v1": h1_2_env_cfg.H1_2SuperMimicV1EnvCfg,
     "Tracking-Flat-H1_2-SuperMimic-Eval-v1": h1_2_env_cfg.H1_2SuperMimicV1EvalEnvCfg,
+    "Tracking-Flat-H1_2-SuperMimic-v2": h1_2_env_cfg.H1_2SuperMimicV2EnvCfg,
+    "Tracking-Flat-H1_2-SuperMimic-Eval-v2": h1_2_env_cfg.H1_2SuperMimicV2EvalEnvCfg,
 }
 
 for _id, _cfg in _TASKS.items():
